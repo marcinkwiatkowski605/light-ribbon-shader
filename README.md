@@ -1,6 +1,8 @@
-# Light Ribbon
+# Light Ribbon Shader
 
 A glowing, twisted ribbon of light, rendered in real time in the browser with [Three.js](https://threejs.org).
+
+**Live demo:** https://marcinkwiatkowski605.github.io/light-ribbon-shader/
 
 ![Light Ribbon preview](preview.jpg)
 
@@ -8,14 +10,11 @@ The ribbon is a thin 3D strip that twists, waves and tapers to sharp points at b
 
 Every value can be changed live from the control panel.
 
-## Run it
+## Run it locally
 
-It is a single HTML file with no build step.
+It is a single HTML file with no build step. Open `index.html` in a modern browser with WebGL 2. If the browser blocks it when opened from disk, start a local server in this folder (`npx serve .` or `python3 -m http.server`) and open the address it prints.
 
-- **Locally:** open `index.html` in a modern browser (Chrome, Edge, Firefox or Safari with WebGL 2). If your browser blocks it when opened from disk, start a small local server in this folder, for example `npx serve .` or `python3 -m http.server`, and open the address it prints.
-- **GitHub Pages:** push this folder to a repository, then go to *Settings → Pages* and publish from the branch root. The page will be live at `https://<your-user>.github.io/<repo>/`.
-
-Three.js and lil-gui are loaded from the jsDelivr CDN, so an internet connection is needed the first time the page loads.
+Three.js and lil-gui load from the jsDelivr CDN, so the first load needs an internet connection.
 
 ## Controls
 
