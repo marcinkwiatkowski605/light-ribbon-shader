@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A glowing, twisted ribbon of light rendered in real time with Three.js.">
+<title>Light ribbon</title>
+<style>
+  :root { color-scheme: dark; --bg: #0a0b0b; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  canvas#c { display: block; width: 100vw; height: 100vh; }
+  .lil-gui.root { --width: 270px; }
+  @media (max-width: 600px) {
+    .lil-gui.root { --width: 220px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import GUI from 'lil-gui';
+
+// ---------------------------------------------------------------------------
+// Parameters (all driven by the lil-gui panel)
+// ---------------------------------------------------------------------------
+const params = {
+  // shape
+  length: 5.6,
+  width: 0.48,
+  taper: 1.6,
+  twist: 0.9,
+  twistSpeed: 0.2,
+  waveAmp: 0.14,
+  waveFreq: 0.55,
+  waveSpeed: 0.3,
+  tilt: -0.3,
+  shear: 1.1,
+  skew: 1.05,
+  roll: 0.055,
+  offsetY: -0.22,
+  // material
+  bodyColor: '#ffe3cc',
+  bodyIntensity: 0.12,
+  bodyGradient: 0.25,
+  foldPower: 5.0,
+  foldIntensity: 1.2,
+  rimWidth: 0.12,
+  rimIntensity: 0.95,
+  rimColorA: '#5fc4ff',
+  rimColorB: '#ffa25a',
+  bottomRim: 0.1,
+  // secondary strand (the bright diagonal core line)
+  strand: true,
+  strandIntensity: 1.6,
+  strandWidth: 0.26,
+  strandSlant: 0.6,
+  tails: true,
+  tailIntensity: 0.45,
+  tailLength: 1.45,
+  // post
+  bloomStrength: 0.38,
+  bloomRadius: 0.65,
+  bloomThreshold: 0.25,
+  blur: 8.5,
+  chromatic: 0.0057,
+  exposure: 0.95,
+  grain: 0.046,
+  background: '#0e1011',
+  paused: false,
+};
+
+// ---------------------------------------------------------------------------
+// Renderer / scene / camera
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// clear to pure black; the soft background tone is added in display space
+// in the final pass (a non-black clear colour gets lifted by the linear
+// pipeline + tone mapping and turns into flat grey)
+renderer.setClearColor(0x000000, 1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = params.exposure;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
+camera.position.set(0, 0, 9);
+
+// ---------------------------------------------------------------------------
+// Ribbon: a dense plane whose vertices are pushed onto a twisted, tapered,
+// waving strip in the vertex shader. The twist is what creates the bright
+// "fold" line (where the strip turns edge-on to the camera) and the two
+// iridescent outer edges, exactly like a thin film of light seen in 3D.
+// ---------------------------------------------------------------------------
+const ribbonVert = /* glsl */`
+  uniform float uTime;
+  uniform float uLength;
+  uniform float uWidth;
+  uniform float uTaper;
+  uniform float uTwist;
+  uniform float uTwistPhase;
+  uniform float uWaveAmp;
+  uniform float uWaveFreq;
+  uniform float uWavePhase;
+  uniform float uOffset;
+  uniform float uSlant;
+  uniform float uShear;
+  uniform float uSkew;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying float vV;
+  varying float vU;
+  varying float vEnv;
+
+  // uSkew moves the widest point of the leaf off-centre (pow(u, k))
+  float envelope(float u) {
+    return pow(max(sin(3.14159265 * pow(clamp(u, 0.0, 1.0), uSkew)), 0.0), uTaper);
+  }
+
+  vec3 ribbonPos(float u, float v) {
+    float env = envelope(u);
+    float x = (u - 0.5) * uLength;
+    float y = uWaveAmp * sin(u * 6.2831853 * uWaveFreq + uWavePhase + uOffset)
+            + uWaveAmp * 0.35 * sin(u * 6.2831853 * uWaveFreq * 2.3 - uWavePhase * 0.7 + uOffset * 2.0)
+            + uSlant * sin(3.14159265 * (u - 0.5)) * env;
+    float theta = uTwist * (u - 0.5) * 3.14159265 + uTwistPhase + uOffset;
+    // shear pushes the top edge's peak one way and the bottom edge's
+    // bulge the other, giving the asymmetric, leaning leaf silhouette
+    vec3 across = vec3(uShear, cos(theta), sin(theta));
+    return vec3(x, y, 0.0) + across * (v * uWidth * env);
+  }
+
+  void main() {
+    float u = uv.x;
+    float v = uv.y * 2.0 - 1.0;
+    vec3 p = ribbonPos(u, v);
+
+    float e = 0.0015;
+    vec3 du = ribbonPos(u + e, v) - ribbonPos(u - e, v);
+    vec3 dv = ribbonPos(u, v + e) - ribbonPos(u, v - e);
+    // guard the degenerate tips (zero width -> zero-length normal -> NaN,
+    // which the bloom blur would smear into big black holes)
+    vec3 c = cross(du, dv);
+    float cl = length(c);
+    vec3 n = cl > 1e-9 ? c / cl : vec3(0.0, 0.0, 1.0);
+
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    vNormalV = normalize(normalMatrix * n);
+    vViewV = normalize(-mv.xyz);
+    vV = v;
+    vU = u;
+    vEnv = envelope(u);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const ribbonFrag = /* glsl */`
+  uniform vec3 uBodyColor;
+  uniform float uBodyIntensity;
+  uniform float uFoldPower;
+  uniform float uFoldIntensity;
+  uniform float uRimWidth;
+  uniform float uRimIntensity;
+  uniform vec3 uRimColorA;
+  uniform vec3 uRimColorB;
+  uniform float uBottomRim;
+  uniform float uBodyGradient;
+  uniform float uSoftCore;
+  uniform float uTailOnly;
+  uniform float uGain;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying float vV;
+  varying float vU;
+  varying float vEnv;
+
+  void main() {
+    float nl = length(vNormalV);
+    float facing = nl > 1e-5 ? abs(dot(vNormalV / nl, normalize(vViewV))) : 0.0;
+    float grazing = 1.0 - facing;
+
+    // translucent film body, a little brighter where it faces the camera
+    vec3 col = uBodyColor * uBodyIntensity * (0.25 + 0.75 * facing) * mix(0.25, 1.0, vEnv);
+    // upper half of the film catches more light than the lower half
+    col *= mix(uBodyGradient, 1.0, smoothstep(-1.0, 1.0, vV));
+
+    // bright fold where the twisted strip turns edge-on
+    col += vec3(1.0, 0.98, 0.95) * pow(grazing, uFoldPower) * uFoldIntensity;
+
+    // thin rims along both outer edges: cool/blue outermost, white, then
+    // a warm band just inside (dispersion-like thin-film gradient)
+    float edgeDist = 1.0 - abs(vV);
+    float s = edgeDist / uRimWidth;
+    vec3 outerC = vV > 0.0 ? uRimColorA : uRimColorB;
+    vec3 innerC = vV > 0.0 ? uRimColorB : uRimColorA;
+    vec3 rimCol = mix(outerC, vec3(1.0), smoothstep(0.0, 0.8, s));
+    rimCol = mix(rimCol, innerC, smoothstep(0.8, 2.0, s));
+    float rim = exp(-s * s * 0.18);
+    float side = vV > 0.0 ? 1.0 : uBottomRim;
+    col += rimCol * rim * uRimIntensity * side;
+
+    // the inner strand / tails are rendered as a soft glowing filament
+    // (gaussian across the width) instead of a film with hard rims
+    if (uSoftCore > 0.5) {
+      float g = exp(-vV * vV * 2.5);
+      col = vec3(1.0, 0.965, 0.92) * g * mix(0.15, 1.0, vEnv)
+          + vec3(1.0) * pow(grazing, uFoldPower) * uFoldIntensity * 0.25 * g;
+      // tails only show outside the main leaf, not across its body
+      if (uTailOnly > 0.5) col *= smoothstep(0.5, 0.8, abs(vU * 2.0 - 1.0));
+    }
+
+    col *= smoothstep(0.0, 0.12, vEnv) * uGain;
+    if (any(isnan(col)) || any(isinf(col))) col = vec3(0.0);
+    gl_FragColor = vec4(clamp(col, 0.0, 64.0), 1.0);
+  }
+`;
+
+function makeRibbonMaterial(offset, gain) {
+  return new THREE.ShaderMaterial({
+    vertexShader: ribbonVert,
+    fragmentShader: ribbonFrag,
+    uniforms: {
+      uTime: { value: 0 },
+      uLength: { value: params.length },
+      uWidth: { value: params.width },
+      uTaper: { value: params.taper },
+      uTwist: { value: params.twist },
+      uTwistPhase: { value: 0 },
+      uWaveAmp: { value: params.waveAmp },
+      uWaveFreq: { value: params.waveFreq },
+      uWavePhase: { value: 0 },
+      uOffset: { value: offset },
+      uBodyColor: { value: new THREE.Color(params.bodyColor) },
+      uBodyIntensity: { value: params.bodyIntensity },
+      uFoldPower: { value: params.foldPower },
+      uFoldIntensity: { value: params.foldIntensity },
+      uRimWidth: { value: params.rimWidth },
+      uRimIntensity: { value: params.rimIntensity },
+      uRimColorA: { value: new THREE.Color(params.rimColorA) },
+      uRimColorB: { value: new THREE.Color(params.rimColorB) },
+      uBottomRim: { value: params.bottomRim },
+      uSlant: { value: 0 },
+      uShear: { value: params.shear },
+      uSkew: { value: params.skew },
+      uBodyGradient: { value: params.bodyGradient },
+      uGain: { value: gain },
+      uSoftCore: { value: 0 },
+      uTailOnly: { value: 0 },
+    },
+    side: THREE.DoubleSide,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+  });
+}
+
+const geometry = new THREE.PlaneGeometry(1, 1, 480, 32);
+// PlaneGeometry uv already spans 0..1 on both axes, which is all the
+// vertex shader needs; positions are rebuilt from uv on the GPU.
+
+const ribbonGroup = new THREE.Group();
+scene.add(ribbonGroup);
+
+const mainMat = makeRibbonMaterial(0.0, 1.0);
+const mainRibbon = new THREE.Mesh(geometry, mainMat);
+mainRibbon.frustumCulled = false;
+ribbonGroup.add(mainRibbon);
+
+// a thinner, fainter secondary strand, slightly out of phase, gives the
+// long wispy tails that extend past the main body in the reference
+const strandMat = makeRibbonMaterial(0.35, params.strandIntensity);
+const strandRibbon = new THREE.Mesh(geometry, strandMat);
+strandRibbon.frustumCulled = false;
+strandRibbon.scale.set(1.08, 1.0, 1.0);
+ribbonGroup.add(strandRibbon);
+strandMat.uniforms.uSoftCore.value = 1;
+
+// very thin, faint hairline tails that run past both tips
+const tailMat = makeRibbonMaterial(0.2, params.tailIntensity);
+tailMat.uniforms.uSoftCore.value = 1;
+tailMat.uniforms.uTailOnly.value = 1;
+const tailRibbon = new THREE.Mesh(geometry, tailMat);
+tailRibbon.frustumCulled = false;
+tailRibbon.scale.set(params.tailLength, 1.0, 1.0);
+ribbonGroup.add(tailRibbon);
+
+// ---------------------------------------------------------------------------
+// Post-processing: bloom for the glow, then chromatic aberration + grain
+// ---------------------------------------------------------------------------
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), params.bloomStrength, params.bloomRadius, params.bloomThreshold);
+composer.addPass(bloom);
+
+const finishShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uChromatic: { value: params.chromatic },
+    uGrain: { value: params.grain },
+    uTime: { value: 0 },
+    uAspect: { value: 1 },
+    uBg: { value: new THREE.Color().setHex(parseInt(params.background.slice(1), 16), THREE.LinearSRGBColorSpace) },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uChromatic;
+    uniform float uGrain;
+    uniform float uTime;
+    uniform float uAspect;
+    uniform vec3 uBg;
+    varying vec2 vUv;
+
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+    void main() {
+      vec2 d = vUv - 0.5;
+      d.x *= uAspect;
+      float len = length(d);
+      vec2 dir = len > 0.0 ? normalize(vUv - 0.5) : vec2(0.0);
+      // dispersion: red pushed outward, blue pulled inward, growing from center
+      vec2 off = dir * uChromatic * (0.35 + len * 1.6);
+      float r = texture2D(tDiffuse, vUv + off).r;
+      float g = texture2D(tDiffuse, vUv).g;
+      float b = texture2D(tDiffuse, vUv - off).b;
+      vec3 col = vec3(r, g, b);
+
+      // soft vignette + a faint background tone that falls off to black
+      col *= mix(0.72, 1.0, smoothstep(0.95, 0.25, len));
+      col += uBg * smoothstep(0.95, 0.05, len);
+
+      // film grain / dither (also hides bloom banding on the dark background)
+      float n = hash(vUv * 1024.0 + fract(uTime) * 91.7) - 0.5;
+      col += n * uGrain;
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+};
+// separable gaussian blur (two passes: horizontal, then vertical), run in
+// linear HDR space before tone mapping so the glow softens naturally
+const blurShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uDir: { value: new THREE.Vector2(1, 0) },
+    uRadius: { value: 0 },
+    uResolution: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform vec2 uDir;
+    uniform float uRadius;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+    void main() {
+      // 13 taps spread over the radius, gaussian weights (sigma = radius / 2)
+      vec2 stepUv = uDir * (uRadius / 6.0) / uResolution;
+      vec4 sum = vec4(0.0);
+      float wsum = 0.0;
+      for (int i = -6; i <= 6; i++) {
+        float x = float(i);
+        float w = exp(-(x * x) / 18.0);
+        sum += texture2D(tDiffuse, vUv + stepUv * x) * w;
+        wsum += w;
+      }
+      gl_FragColor = sum / wsum;
+    }
+  `,
+};
+const blurH = new ShaderPass(blurShader);
+const blurV = new ShaderPass(blurShader);
+blurV.uniforms.uDir.value.set(0, 1);
+composer.addPass(blurH);
+composer.addPass(blurV);
+
+// tone mapping + sRGB first, then chromatic aberration / grain / vignette
+// in display space (adding grain in linear space lifts the blacks a lot)
+composer.addPass(new OutputPass());
+const finishPass = new ShaderPass(finishShader);
+composer.addPass(finishPass);
+
+// ---------------------------------------------------------------------------
+// GUI
+// ---------------------------------------------------------------------------
+const gui = new GUI({ title: 'Light ribbon' });
+if (window.innerWidth < 700) gui.close();
+
+const fShape = gui.addFolder('Shape');
+fShape.add(params, 'length', 2, 10, 0.01).name('Length');
+fShape.add(params, 'width', 0.05, 2, 0.01).name('Width');
+fShape.add(params, 'taper', 0.3, 4, 0.01).name('Tip taper');
+fShape.add(params, 'twist', 0, 4, 0.01).name('Twist');
+fShape.add(params, 'twistSpeed', -1.5, 1.5, 0.01).name('Twist speed');
+fShape.add(params, 'waveAmp', 0, 1, 0.005).name('Wave amplitude');
+fShape.add(params, 'waveFreq', 0, 3, 0.01).name('Wave frequency');
+fShape.add(params, 'waveSpeed', -2, 2, 0.01).name('Wave speed');
+fShape.add(params, 'tilt', -1.5, 1.5, 0.01).name('Tilt (3D)');
+fShape.add(params, 'shear', -2, 2, 0.01).name('Leaf lean');
+fShape.add(params, 'roll', -0.5, 0.5, 0.005).name('Rotation');
+fShape.add(params, 'skew', 0.5, 2, 0.01).name('Belly offset');
+fShape.add(params, 'offsetY', -1.5, 1.5, 0.01).name('Vertical position');
+
+const fMat = gui.addFolder('Light & color');
+fMat.addColor(params, 'bodyColor').name('Ribbon color');
+fMat.add(params, 'bodyIntensity', 0, 2, 0.01).name('Ribbon brightness');
+fMat.add(params, 'bodyGradient', 0, 1, 0.01).name('Lower half brightness');
+fMat.add(params, 'foldPower', 1, 20, 0.1).name('Fold sharpness');
+fMat.add(params, 'foldIntensity', 0, 8, 0.01).name('Fold brightness');
+fMat.add(params, 'rimWidth', 0.01, 0.4, 0.001).name('Edge width');
+fMat.add(params, 'rimIntensity', 0, 5, 0.01).name('Edge brightness');
+fMat.addColor(params, 'rimColorA').name('Edge – cool');
+fMat.addColor(params, 'rimColorB').name('Edge – warm');
+fMat.add(params, 'bottomRim', 0, 1.5, 0.01).name('Lower edge brightness');
+fMat.add(params, 'strand').name('Inner strand');
+fMat.add(params, 'strandIntensity', 0, 3, 0.01).name('Strand brightness');
+fMat.add(params, 'strandWidth', 0.02, 0.6, 0.005).name('Strand width');
+fMat.add(params, 'strandSlant', -0.8, 0.8, 0.005).name('Strand slant');
+fMat.add(params, 'tails').name('Tails');
+fMat.add(params, 'tailIntensity', 0, 3, 0.01).name('Tail brightness');
+fMat.add(params, 'tailLength', 1, 2, 0.01).name('Tail length');
+
+const fPost = gui.addFolder('Post-processing');
+fPost.add(params, 'bloomStrength', 0, 3, 0.01).name('Bloom strength');
+fPost.add(params, 'bloomRadius', 0, 1.5, 0.01).name('Bloom radius');
+fPost.add(params, 'bloomThreshold', 0, 1, 0.005).name('Bloom threshold');
+fPost.add(params, 'blur', 0, 40, 0.1).name('Blur (px)');
+fPost.add(params, 'chromatic', 0, 0.02, 0.0001).name('Chromatic aberration');
+fPost.add(params, 'exposure', 0.2, 2.5, 0.01).name('Exposure');
+fPost.add(params, 'grain', 0, 0.12, 0.001).name('Grain');
+fPost.addColor(params, 'background').name('Background');
+gui.add(params, 'paused').name('Pause');
+
+// ---------------------------------------------------------------------------
+// Resize + loop
+// ---------------------------------------------------------------------------
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  finishPass.uniforms.uAspect.value = w / h;
+  const db = renderer.getDrawingBufferSize(new THREE.Vector2());
+  blurH.uniforms.uResolution.value.copy(db);
+  blurV.uniforms.uResolution.value.copy(db);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function syncMaterial(mat, gain) {
+  const u = mat.uniforms;
+  u.uLength.value = params.length;
+  u.uWidth.value = params.width;
+  u.uTaper.value = params.taper;
+  u.uTwist.value = params.twist;
+  u.uWaveAmp.value = params.waveAmp;
+  u.uWaveFreq.value = params.waveFreq;
+  u.uBodyColor.value.set(params.bodyColor);
+  u.uBodyIntensity.value = params.bodyIntensity;
+  u.uFoldPower.value = params.foldPower;
+  u.uFoldIntensity.value = params.foldIntensity;
+  u.uRimWidth.value = params.rimWidth;
+  u.uRimIntensity.value = params.rimIntensity;
+  u.uRimColorA.value.set(params.rimColorA);
+  u.uRimColorB.value.set(params.rimColorB);
+  u.uBottomRim.value = params.bottomRim;
+  u.uShear.value = params.shear;
+  u.uSkew.value = params.skew;
+  u.uBodyGradient.value = params.bodyGradient;
+  u.uGain.value = gain;
+}
+
+const clock = new THREE.Clock();
+let simTime = 0;
+
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (!params.paused) simTime += dt;
+
+  syncMaterial(mainMat, 1.0);
+  syncMaterial(strandMat, params.strandIntensity);
+  strandRibbon.visible = params.strand;
+  strandMat.uniforms.uWidth.value = params.width * params.strandWidth;
+  strandMat.uniforms.uSlant.value = params.strandSlant;
+  mainMat.uniforms.uSlant.value = 0.0;
+  syncMaterial(tailMat, params.tailIntensity);
+  tailRibbon.visible = params.tails;
+  tailRibbon.scale.x = params.tailLength;
+  tailMat.uniforms.uWidth.value = 0.018;
+  tailMat.uniforms.uTaper.value = 0.6;
+  tailMat.uniforms.uSlant.value = params.strandSlant * 0.3;
+  ribbonGroup.position.y = params.offsetY;
+
+  for (const m of [mainMat, strandMat, tailMat]) {
+    m.uniforms.uTwistPhase.value = simTime * params.twistSpeed;
+    m.uniforms.uWavePhase.value = simTime * params.waveSpeed;
+  }
+
+  // keep the whole ribbon (plus some air) in frame on any aspect ratio
+  const halfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+  const fitZ = (params.length * 1.45 * 0.5) / (Math.tan(halfFov) * camera.aspect);
+  camera.position.z = Math.max(9, fitZ);
+
+  ribbonGroup.rotation.x = params.tilt;
+  ribbonGroup.rotation.z = params.roll;
+
+  bloom.strength = params.bloomStrength;
+  bloom.radius = params.bloomRadius;
+  bloom.threshold = params.bloomThreshold;
+  renderer.toneMappingExposure = params.exposure;
+  finishPass.uniforms.uChromatic.value = params.chromatic;
+  const blurOn = params.blur > 0.05;
+  blurH.enabled = blurOn;
+  blurV.enabled = blurOn;
+  blurH.uniforms.uRadius.value = params.blur;
+  blurV.uniforms.uRadius.value = params.blur;
+  finishPass.uniforms.uGrain.value = params.grain;
+  finishPass.uniforms.uBg.value.setHex(parseInt(params.background.slice(1), 16), THREE.LinearSRGBColorSpace);
+  finishPass.uniforms.uTime.value = simTime;
+
+  composer.render();
+  requestAnimationFrame(tick);
+}
+tick();
+
+// debug handle (handy for screenshots from the console)
+window.__ribbon = { params, simTimeSet: (t) => { simTime = t; }, renderer, composer, finishPass, bloom, scene };
+</script>
+</body>
+</html>
